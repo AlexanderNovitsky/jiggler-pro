@@ -1,15 +1,27 @@
 #include <furi.h>
 #include <furi_hal.h>
 #include <gui/gui.h>
+#include <storage/storage.h>
 
-#define JIGGLE_PERIOD_MS 1000
-#define JIGGLE_MIN_PX    30
-#define JIGGLE_MAX_PX    50
+#define JIGGLE_SETTINGS_PATH APP_DATA_PATH("settings.txt")
+
+#define JIGGLE_PERIOD_MS     1000
+#define JIGGLE_RANGE_MIN     1
+#define JIGGLE_RANGE_MAX     120
+#define JIGGLE_RANGE_DEFAULT 40
 
 typedef enum {
     JigglerEventToggle,
     JigglerEventExit,
+    JigglerEventBack,
+    JigglerEventRangeDec,
+    JigglerEventRangeInc,
 } JigglerEvent;
+
+typedef enum {
+    JigglerScreenMain,
+    JigglerScreenSettings,
+} JigglerScreen;
 
 typedef struct {
     Gui* gui;
@@ -17,7 +29,10 @@ typedef struct {
     FuriMessageQueue* queue;
     FuriTimer* timer;
     FuriHalUsbInterface* usb_prev;
+    JigglerScreen screen;
     bool running;
+    bool resume_running;
+    uint8_t range_px;
     int8_t return_dx;
     int8_t last_dx;
 } JigglerApp;
@@ -45,21 +60,34 @@ static void jiggler_draw_hint(Canvas* canvas, int32_t x, const char* text, bool 
     canvas_set_color(canvas, ColorBlack);
 }
 
-static void jiggler_draw_callback(Canvas* canvas, void* ctx) {
-    JigglerApp* app = ctx;
-    char line[24];
-    const char* status = app->running ? "Running" : "Paused";
-
-    canvas_clear(canvas);
-
+static void jiggler_draw_header(Canvas* canvas, const char* title) {
     canvas_set_color(canvas, ColorBlack);
     canvas_draw_box(canvas, 0, 0, 128, 13);
     canvas_set_color(canvas, ColorWhite);
     canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str(canvas, 3, 10, "Jiggler Pro");
+    canvas_draw_str(canvas, 3, 10, title);
     canvas_set_font(canvas, FontSecondary);
     canvas_draw_str(canvas, 108, 10, furi_hal_hid_is_connected() ? "USB" : "NO");
     canvas_set_color(canvas, ColorBlack);
+}
+
+static void jiggler_draw_arrow_key(Canvas* canvas, int32_t x, bool enabled, bool points_left) {
+    if(enabled) {
+        canvas_draw_rbox(canvas, x, 27, 18, 18, 2);
+        canvas_set_color(canvas, ColorWhite);
+    } else {
+        canvas_draw_rframe(canvas, x, 27, 18, 18, 2);
+    }
+
+    jiggler_draw_chevron(canvas, x + 6, 33, points_left);
+    canvas_set_color(canvas, ColorBlack);
+}
+
+static void jiggler_draw_main(Canvas* canvas, JigglerApp* app) {
+    char line[24];
+    const char* status = app->running ? "Running" : "Paused";
+
+    jiggler_draw_header(canvas, "Jiggler Pro");
 
     canvas_set_font(canvas, FontPrimary);
     uint16_t status_w = canvas_string_width(canvas, status);
@@ -88,18 +116,63 @@ static void jiggler_draw_callback(Canvas* canvas, void* ctx) {
     }
 
     jiggler_draw_hint(canvas, 2, app->running ? "OK Pause" : "OK Start", false);
-    jiggler_draw_hint(canvas, 126, "hold Back", true);
+    jiggler_draw_hint(canvas, 126, "Back", true);
+}
+
+static void jiggler_draw_settings(Canvas* canvas, JigglerApp* app) {
+    char value[8];
+
+    jiggler_draw_header(canvas, "Settings");
+
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str_aligned(canvas, 64, 24, AlignCenter, AlignBottom, "Range");
+
+    snprintf(value, sizeof(value), "%u", app->range_px);
+    canvas_set_font(canvas, FontBigNumbers);
+    uint16_t value_w = canvas_string_width(canvas, value);
+    canvas_draw_str_aligned(canvas, 58, 46, AlignCenter, AlignBottom, value);
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 58 + (value_w / 2) + 4, 44, "px");
+
+    jiggler_draw_arrow_key(canvas, 6, app->range_px > JIGGLE_RANGE_MIN, true);
+    jiggler_draw_arrow_key(canvas, 104, app->range_px < JIGGLE_RANGE_MAX, false);
+    jiggler_draw_hint(canvas, 126, "Back", true);
+}
+
+static void jiggler_draw_callback(Canvas* canvas, void* ctx) {
+    JigglerApp* app = ctx;
+
+    canvas_clear(canvas);
+    if(app->screen == JigglerScreenSettings) {
+        jiggler_draw_settings(canvas, app);
+    } else {
+        jiggler_draw_main(canvas, app);
+    }
 }
 
 static void jiggler_input_callback(InputEvent* event, void* ctx) {
     JigglerApp* app = ctx;
     JigglerEvent message;
+    bool send = false;
 
-    if(event->key == InputKeyOk && event->type == InputTypeShort) {
-        message = JigglerEventToggle;
-        furi_message_queue_put(app->queue, &message, 0);
+    if(event->key == InputKeyBack && event->type == InputTypeShort) {
+        message = JigglerEventBack;
+        send = true;
     } else if(event->key == InputKeyBack && event->type == InputTypeLong) {
         message = JigglerEventExit;
+        send = true;
+    } else if(event->key == InputKeyOk && event->type == InputTypeShort &&
+              app->screen == JigglerScreenMain) {
+        message = JigglerEventToggle;
+        send = true;
+    } else if((event->key == InputKeyLeft || event->key == InputKeyRight) &&
+              (event->type == InputTypeShort || event->type == InputTypeRepeat) &&
+              app->screen == JigglerScreenSettings) {
+        message = (event->key == InputKeyLeft) ? JigglerEventRangeDec : JigglerEventRangeInc;
+        send = true;
+    }
+
+    if(send) {
         furi_message_queue_put(app->queue, &message, 0);
     }
 }
@@ -116,8 +189,7 @@ static void jiggler_timer_callback(void* ctx) {
         dx = app->return_dx;
         app->return_dx = 0;
     } else {
-        uint32_t span = JIGGLE_MAX_PX - JIGGLE_MIN_PX + 1;
-        dx = (int8_t)(JIGGLE_MIN_PX + (furi_hal_random_get() % span));
+        dx = (int8_t)app->range_px;
         app->return_dx = (int8_t)-dx;
     }
 
@@ -136,13 +208,99 @@ static void jiggler_set_running(JigglerApp* app, bool running) {
     view_port_update(app->view_port);
 }
 
+static void jiggler_settings_save(const JigglerApp* app);
+
+static void jiggler_open_settings(JigglerApp* app) {
+    app->resume_running = app->running;
+    app->screen = JigglerScreenSettings;
+    jiggler_set_running(app, false);
+}
+
+static void jiggler_close_settings(JigglerApp* app) {
+    app->screen = JigglerScreenMain;
+    jiggler_set_running(app, app->resume_running);
+    jiggler_settings_save(app);
+}
+
+static bool jiggler_parse_range(const char* text, uint8_t* out) {
+    if(text[0] < '0' || text[0] > '9') {
+        return false;
+    }
+
+    unsigned value = 0;
+    for(const char* cursor = text; *cursor >= '0' && *cursor <= '9'; cursor++) {
+        value = value * 10u + (unsigned)(*cursor - '0');
+        if(value > JIGGLE_RANGE_MAX) {
+            return false;
+        }
+    }
+
+    if(value < JIGGLE_RANGE_MIN) {
+        return false;
+    }
+
+    *out = (uint8_t)value;
+    return true;
+}
+
+static void jiggler_settings_load(JigglerApp* app) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* file = storage_file_alloc(storage);
+
+    if(storage_file_open(file, JIGGLE_SETTINGS_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        char buf[8] = {0};
+        size_t read = storage_file_read(file, buf, sizeof(buf) - 1);
+        uint8_t range = 0;
+        if(read > 0 && jiggler_parse_range(buf, &range)) {
+            app->range_px = range;
+        }
+        storage_file_close(file);
+    }
+
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+}
+
+static void jiggler_settings_save(const JigglerApp* app) {
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    File* file = storage_file_alloc(storage);
+
+    if(storage_file_open(file, JIGGLE_SETTINGS_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+        char buf[8];
+        int length = snprintf(buf, sizeof(buf), "%u\n", app->range_px);
+        if(length > 0) {
+            storage_file_write(file, buf, (size_t)length);
+        }
+        storage_file_close(file);
+    }
+
+    storage_file_free(file);
+    furi_record_close(RECORD_STORAGE);
+}
+
+static void jiggler_change_range(JigglerApp* app, int8_t delta) {
+    int16_t next = (int16_t)app->range_px + delta;
+    if(next < JIGGLE_RANGE_MIN) {
+        next = JIGGLE_RANGE_MIN;
+    } else if(next > JIGGLE_RANGE_MAX) {
+        next = JIGGLE_RANGE_MAX;
+    }
+
+    app->range_px = (uint8_t)next;
+    view_port_update(app->view_port);
+}
+
 int32_t jiggler_pro_app(void* p) {
     UNUSED(p);
 
     JigglerApp* app = malloc(sizeof(JigglerApp));
+    app->screen = JigglerScreenMain;
     app->running = true;
+    app->resume_running = false;
+    app->range_px = JIGGLE_RANGE_DEFAULT;
     app->return_dx = 0;
     app->last_dx = 0;
+    jiggler_settings_load(app);
     app->queue = furi_message_queue_alloc(8, sizeof(JigglerEvent));
     app->view_port = view_port_alloc();
     app->timer = furi_timer_alloc(jiggler_timer_callback, FuriTimerTypePeriodic, app);
@@ -167,7 +325,26 @@ int32_t jiggler_pro_app(void* p) {
 
         switch(event) {
         case JigglerEventToggle:
-            jiggler_set_running(app, !app->running);
+            if(app->screen == JigglerScreenMain) {
+                jiggler_set_running(app, !app->running);
+            }
+            break;
+        case JigglerEventBack:
+            if(app->screen == JigglerScreenSettings) {
+                jiggler_close_settings(app);
+            } else {
+                jiggler_open_settings(app);
+            }
+            break;
+        case JigglerEventRangeDec:
+            if(app->screen == JigglerScreenSettings) {
+                jiggler_change_range(app, -1);
+            }
+            break;
+        case JigglerEventRangeInc:
+            if(app->screen == JigglerScreenSettings) {
+                jiggler_change_range(app, 1);
+            }
             break;
         case JigglerEventExit:
             exit = true;
@@ -176,6 +353,7 @@ int32_t jiggler_pro_app(void* p) {
     }
 
     furi_timer_stop(app->timer);
+    jiggler_settings_save(app);
     furi_hal_usb_set_config(app->usb_prev, NULL);
 
     gui_remove_view_port(app->gui, app->view_port);
