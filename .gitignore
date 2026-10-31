@@ -1,2 +1,7 @@
 # local dev env
 .env
+
+# uFBT
+.ufbt/
+.vscode/
+dist/
