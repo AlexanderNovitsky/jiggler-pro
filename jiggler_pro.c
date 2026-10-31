@@ -9,19 +9,31 @@
 #define JIGGLE_RANGE_MIN     1
 #define JIGGLE_RANGE_MAX     120
 #define JIGGLE_RANGE_DEFAULT 40
+#define JIGGLE_PAUSE_MIN     1
+#define JIGGLE_PAUSE_MAX     180
+#define JIGGLE_PAUSE_DEFAULT 10
 
 typedef enum {
     JigglerEventToggle,
     JigglerEventExit,
     JigglerEventBack,
-    JigglerEventRangeDec,
-    JigglerEventRangeInc,
+    JigglerEventValueDec,
+    JigglerEventValueInc,
+    JigglerEventSelectPrev,
+    JigglerEventSelectNext,
+    JigglerEventPauseDone,
 } JigglerEvent;
 
 typedef enum {
     JigglerScreenMain,
     JigglerScreenSettings,
 } JigglerScreen;
+
+typedef enum {
+    JigglerSettingRange,
+    JigglerSettingPause,
+    JigglerSettingCount,
+} JigglerSetting;
 
 typedef struct {
     Gui* gui;
@@ -30,9 +42,12 @@ typedef struct {
     FuriTimer* timer;
     FuriHalUsbInterface* usb_prev;
     JigglerScreen screen;
+    JigglerSetting setting;
     bool running;
     bool resume_running;
     uint8_t range_px;
+    uint8_t pause_sec;
+    uint8_t pause_left;
     int8_t return_dx;
     int8_t last_dx;
 } JigglerApp;
@@ -71,18 +86,6 @@ static void jiggler_draw_header(Canvas* canvas, const char* title) {
     canvas_set_color(canvas, ColorBlack);
 }
 
-static void jiggler_draw_arrow_key(Canvas* canvas, int32_t x, bool enabled, bool points_left) {
-    if(enabled) {
-        canvas_draw_rbox(canvas, x, 27, 18, 18, 2);
-        canvas_set_color(canvas, ColorWhite);
-    } else {
-        canvas_draw_rframe(canvas, x, 27, 18, 18, 2);
-    }
-
-    jiggler_draw_chevron(canvas, x + 6, 33, points_left);
-    canvas_set_color(canvas, ColorBlack);
-}
-
 static void jiggler_draw_main(Canvas* canvas, JigglerApp* app) {
     char line[24];
     const char* status = app->running ? "Running" : "Paused";
@@ -108,7 +111,10 @@ static void jiggler_draw_main(Canvas* canvas, JigglerApp* app) {
     }
 
     canvas_set_font(canvas, FontSecondary);
-    if(app->last_dx == 0) {
+    if(!app->running && app->pause_left > 0) {
+        snprintf(line, sizeof(line), "%u s left", app->pause_left);
+        canvas_draw_str_aligned(canvas, 64, 48, AlignCenter, AlignBottom, line);
+    } else if(app->last_dx == 0) {
         canvas_draw_str_aligned(canvas, 64, 48, AlignCenter, AlignBottom, "Last move  --");
     } else {
         snprintf(line, sizeof(line), "Last move  %+d px", (int)app->last_dx);
@@ -119,23 +125,39 @@ static void jiggler_draw_main(Canvas* canvas, JigglerApp* app) {
     jiggler_draw_hint(canvas, 126, "Back", true);
 }
 
+static void jiggler_draw_setting_row(
+    Canvas* canvas,
+    int32_t y,
+    const char* label,
+    const char* value,
+    bool selected) {
+    if(selected) {
+        canvas_draw_rbox(canvas, 2, y, 124, 16, 2);
+        canvas_set_color(canvas, ColorWhite);
+    }
+
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 8, y + 11, label);
+    canvas_draw_str_aligned(canvas, 120, y + 11, AlignRight, AlignBottom, value);
+    canvas_set_color(canvas, ColorBlack);
+}
+
 static void jiggler_draw_settings(Canvas* canvas, JigglerApp* app) {
-    char value[8];
+    char range_value[16];
+    char pause_value[16];
+    bool range_selected = app->setting == JigglerSettingRange;
+
+    if(range_selected) {
+        snprintf(range_value, sizeof(range_value), "< %u px >", app->range_px);
+        snprintf(pause_value, sizeof(pause_value), "%u s", app->pause_sec);
+    } else {
+        snprintf(range_value, sizeof(range_value), "%u px", app->range_px);
+        snprintf(pause_value, sizeof(pause_value), "< %u s >", app->pause_sec);
+    }
 
     jiggler_draw_header(canvas, "Settings");
-
-    canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str_aligned(canvas, 64, 24, AlignCenter, AlignBottom, "Range");
-
-    snprintf(value, sizeof(value), "%u", app->range_px);
-    canvas_set_font(canvas, FontBigNumbers);
-    uint16_t value_w = canvas_string_width(canvas, value);
-    canvas_draw_str_aligned(canvas, 58, 46, AlignCenter, AlignBottom, value);
-    canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str(canvas, 58 + (value_w / 2) + 4, 44, "px");
-
-    jiggler_draw_arrow_key(canvas, 6, app->range_px > JIGGLE_RANGE_MIN, true);
-    jiggler_draw_arrow_key(canvas, 104, app->range_px < JIGGLE_RANGE_MAX, false);
+    jiggler_draw_setting_row(canvas, 16, "Range", range_value, range_selected);
+    jiggler_draw_setting_row(canvas, 34, "Pause", pause_value, !range_selected);
     jiggler_draw_hint(canvas, 126, "Back", true);
 }
 
@@ -154,6 +176,7 @@ static void jiggler_input_callback(InputEvent* event, void* ctx) {
     JigglerApp* app = ctx;
     JigglerEvent message;
     bool send = false;
+    bool repeatable = event->type == InputTypeShort || event->type == InputTypeRepeat;
 
     if(event->key == InputKeyBack && event->type == InputTypeShort) {
         message = JigglerEventBack;
@@ -165,11 +188,20 @@ static void jiggler_input_callback(InputEvent* event, void* ctx) {
               app->screen == JigglerScreenMain) {
         message = JigglerEventToggle;
         send = true;
-    } else if((event->key == InputKeyLeft || event->key == InputKeyRight) &&
-              (event->type == InputTypeShort || event->type == InputTypeRepeat) &&
-              app->screen == JigglerScreenSettings) {
-        message = (event->key == InputKeyLeft) ? JigglerEventRangeDec : JigglerEventRangeInc;
-        send = true;
+    } else if(app->screen == JigglerScreenSettings && repeatable) {
+        if(event->key == InputKeyLeft) {
+            message = JigglerEventValueDec;
+            send = true;
+        } else if(event->key == InputKeyRight) {
+            message = JigglerEventValueInc;
+            send = true;
+        } else if(event->key == InputKeyUp) {
+            message = JigglerEventSelectPrev;
+            send = true;
+        } else if(event->key == InputKeyDown) {
+            message = JigglerEventSelectNext;
+            send = true;
+        }
     }
 
     if(send) {
@@ -177,13 +209,8 @@ static void jiggler_input_callback(InputEvent* event, void* ctx) {
     }
 }
 
-static void jiggler_timer_callback(void* ctx) {
-    JigglerApp* app = ctx;
+static void jiggler_step(JigglerApp* app) {
     int8_t dx;
-
-    if(!app->running) {
-        return;
-    }
 
     if(app->return_dx != 0) {
         dx = app->return_dx;
@@ -198,14 +225,58 @@ static void jiggler_timer_callback(void* ctx) {
     view_port_update(app->view_port);
 }
 
-static void jiggler_set_running(JigglerApp* app, bool running) {
-    app->running = running;
-    if(running) {
+static void jiggler_timer_callback(void* ctx) {
+    JigglerApp* app = ctx;
+
+    if(app->screen != JigglerScreenMain) {
+        return;
+    }
+
+    if(app->running) {
+        jiggler_step(app);
+        return;
+    }
+
+    if(app->pause_left == 0) {
+        return;
+    }
+
+    app->pause_left--;
+    if(app->pause_left == 0) {
+        JigglerEvent message = JigglerEventPauseDone;
+        furi_message_queue_put(app->queue, &message, 0);
+    }
+    view_port_update(app->view_port);
+}
+
+static void jiggler_sync_timer(JigglerApp* app) {
+    bool need_timer = app->screen == JigglerScreenMain && (app->running || app->pause_left > 0);
+
+    // furi_timer_stop only queues the stop, so is_running can still be true
+    // when it returns. Always start when the timer is needed.
+    if(need_timer) {
         furi_timer_start(app->timer, furi_ms_to_ticks(JIGGLE_PERIOD_MS));
     } else {
         furi_timer_stop(app->timer);
     }
-    view_port_update(app->view_port);
+}
+
+static void jiggler_play_resume_tune(void) {
+    const float notes[] = {523.25f, 659.25f, 783.99f, 1046.50f, 783.99f, 246.94f};
+    const uint8_t hold_ms[] = {70, 70, 70, 110, 50, 180};
+
+    if(!furi_hal_speaker_acquire(50)) {
+        return;
+    }
+
+    for(size_t i = 0; i < COUNT_OF(notes); i++) {
+        furi_hal_speaker_start(notes[i], 0.6f);
+        furi_delay_ms(hold_ms[i]);
+        furi_hal_speaker_stop();
+        furi_delay_ms(25);
+    }
+
+    furi_hal_speaker_release();
 }
 
 static void jiggler_settings_save(const JigglerApp* app);
@@ -213,34 +284,49 @@ static void jiggler_settings_save(const JigglerApp* app);
 static void jiggler_open_settings(JigglerApp* app) {
     app->resume_running = app->running;
     app->screen = JigglerScreenSettings;
-    jiggler_set_running(app, false);
+    app->running = false;
+    jiggler_sync_timer(app);
+    view_port_update(app->view_port);
 }
 
 static void jiggler_close_settings(JigglerApp* app) {
     app->screen = JigglerScreenMain;
-    jiggler_set_running(app, app->resume_running);
+    app->running = app->resume_running;
+    if(app->running) {
+        app->pause_left = 0;
+    }
+    jiggler_sync_timer(app);
+    view_port_update(app->view_port);
     jiggler_settings_save(app);
 }
 
-static bool jiggler_parse_range(const char* text, uint8_t* out) {
-    if(text[0] < '0' || text[0] > '9') {
-        return false;
+static const char* jiggler_parse_uint(
+    const char* text,
+    unsigned min_value,
+    unsigned max_value,
+    uint8_t* out) {
+    while(*text == ' ') {
+        text++;
+    }
+    if(*text < '0' || *text > '9') {
+        return NULL;
     }
 
     unsigned value = 0;
-    for(const char* cursor = text; *cursor >= '0' && *cursor <= '9'; cursor++) {
-        value = value * 10u + (unsigned)(*cursor - '0');
-        if(value > JIGGLE_RANGE_MAX) {
-            return false;
+    while(*text >= '0' && *text <= '9') {
+        value = value * 10u + (unsigned)(*text - '0');
+        if(value > max_value) {
+            return NULL;
         }
+        text++;
     }
 
-    if(value < JIGGLE_RANGE_MIN) {
-        return false;
+    if(value < min_value) {
+        return NULL;
     }
 
     *out = (uint8_t)value;
-    return true;
+    return text;
 }
 
 static void jiggler_settings_load(JigglerApp* app) {
@@ -248,11 +334,21 @@ static void jiggler_settings_load(JigglerApp* app) {
     File* file = storage_file_alloc(storage);
 
     if(storage_file_open(file, JIGGLE_SETTINGS_PATH, FSAM_READ, FSOM_OPEN_EXISTING)) {
-        char buf[8] = {0};
+        char buf[16] = {0};
         size_t read = storage_file_read(file, buf, sizeof(buf) - 1);
-        uint8_t range = 0;
-        if(read > 0 && jiggler_parse_range(buf, &range)) {
-            app->range_px = range;
+        if(read > 0) {
+            uint8_t range = 0;
+            const char* cursor =
+                jiggler_parse_uint(buf, JIGGLE_RANGE_MIN, JIGGLE_RANGE_MAX, &range);
+            if(cursor != NULL) {
+                app->range_px = range;
+                uint8_t pause_sec = 0;
+                cursor = jiggler_parse_uint(
+                    cursor, JIGGLE_PAUSE_MIN, JIGGLE_PAUSE_MAX, &pause_sec);
+                if(cursor != NULL) {
+                    app->pause_sec = pause_sec;
+                }
+            }
         }
         storage_file_close(file);
     }
@@ -266,8 +362,8 @@ static void jiggler_settings_save(const JigglerApp* app) {
     File* file = storage_file_alloc(storage);
 
     if(storage_file_open(file, JIGGLE_SETTINGS_PATH, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-        char buf[8];
-        int length = snprintf(buf, sizeof(buf), "%u\n", app->range_px);
+        char buf[16];
+        int length = snprintf(buf, sizeof(buf), "%u %u\n", app->range_px, app->pause_sec);
         if(length > 0) {
             storage_file_write(file, buf, (size_t)length);
         }
@@ -278,16 +374,57 @@ static void jiggler_settings_save(const JigglerApp* app) {
     furi_record_close(RECORD_STORAGE);
 }
 
-static void jiggler_change_range(JigglerApp* app, int8_t delta) {
-    int16_t next = (int16_t)app->range_px + delta;
-    if(next < JIGGLE_RANGE_MIN) {
-        next = JIGGLE_RANGE_MIN;
-    } else if(next > JIGGLE_RANGE_MAX) {
-        next = JIGGLE_RANGE_MAX;
+static void jiggler_change_selected(JigglerApp* app, int8_t delta) {
+    int16_t next;
+    uint8_t min_value;
+    uint8_t max_value;
+    uint8_t* field;
+
+    if(app->setting == JigglerSettingRange) {
+        field = &app->range_px;
+        min_value = JIGGLE_RANGE_MIN;
+        max_value = JIGGLE_RANGE_MAX;
+    } else {
+        field = &app->pause_sec;
+        min_value = JIGGLE_PAUSE_MIN;
+        max_value = JIGGLE_PAUSE_MAX;
     }
 
-    app->range_px = (uint8_t)next;
+    next = (int16_t)(*field) + delta;
+    if(next < min_value) {
+        next = min_value;
+    } else if(next > max_value) {
+        next = max_value;
+    }
+
+    *field = (uint8_t)next;
     view_port_update(app->view_port);
+}
+
+static void jiggler_toggle_pause(JigglerApp* app) {
+    if(app->running) {
+        app->running = false;
+        app->pause_left = app->pause_sec;
+    } else {
+        app->running = true;
+        app->pause_left = 0;
+    }
+
+    jiggler_sync_timer(app);
+    view_port_update(app->view_port);
+}
+
+static void jiggler_finish_pause(JigglerApp* app) {
+    if(app->screen != JigglerScreenMain || app->running) {
+        return;
+    }
+
+    jiggler_play_resume_tune();
+    app->running = true;
+    app->pause_left = 0;
+    furi_timer_stop(app->timer);
+    furi_timer_start(app->timer, furi_ms_to_ticks(JIGGLE_PERIOD_MS));
+    jiggler_step(app);
 }
 
 int32_t jiggler_pro_app(void* p) {
@@ -295,9 +432,12 @@ int32_t jiggler_pro_app(void* p) {
 
     JigglerApp* app = malloc(sizeof(JigglerApp));
     app->screen = JigglerScreenMain;
+    app->setting = JigglerSettingRange;
     app->running = true;
     app->resume_running = false;
     app->range_px = JIGGLE_RANGE_DEFAULT;
+    app->pause_sec = JIGGLE_PAUSE_DEFAULT;
+    app->pause_left = 0;
     app->return_dx = 0;
     app->last_dx = 0;
     jiggler_settings_load(app);
@@ -326,7 +466,7 @@ int32_t jiggler_pro_app(void* p) {
         switch(event) {
         case JigglerEventToggle:
             if(app->screen == JigglerScreenMain) {
-                jiggler_set_running(app, !app->running);
+                jiggler_toggle_pause(app);
             }
             break;
         case JigglerEventBack:
@@ -336,15 +476,30 @@ int32_t jiggler_pro_app(void* p) {
                 jiggler_open_settings(app);
             }
             break;
-        case JigglerEventRangeDec:
+        case JigglerEventValueDec:
             if(app->screen == JigglerScreenSettings) {
-                jiggler_change_range(app, -1);
+                jiggler_change_selected(app, -1);
             }
             break;
-        case JigglerEventRangeInc:
+        case JigglerEventValueInc:
             if(app->screen == JigglerScreenSettings) {
-                jiggler_change_range(app, 1);
+                jiggler_change_selected(app, 1);
             }
+            break;
+        case JigglerEventSelectPrev:
+            if(app->setting > JigglerSettingRange) {
+                app->setting--;
+                view_port_update(app->view_port);
+            }
+            break;
+        case JigglerEventSelectNext:
+            if(app->setting + 1 < JigglerSettingCount) {
+                app->setting++;
+                view_port_update(app->view_port);
+            }
+            break;
+        case JigglerEventPauseDone:
+            jiggler_finish_pause(app);
             break;
         case JigglerEventExit:
             exit = true;
